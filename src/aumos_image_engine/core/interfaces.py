@@ -9,10 +9,14 @@ Protocols:
 - MetadataStripperProtocol: Removes EXIF/IPTC/XMP/DICOM metadata
 - WatermarkerProtocol: Embeds C2PA provenance and invisible watermarks
 - BiometricVerifierProtocol: Verifies NIST FRVT non-linkability compliance
+- ImageQualityEvaluatorProtocol: Computes FID, IS, LPIPS, SSIM, PSNR
+- MedicalImagingProtocol: DICOM creation, validation, and anonymization
+- ImageExportProtocol: Multi-format export and MinIO/S3 storage upload
 """
 
 from __future__ import annotations
 
+import uuid
 from typing import Any, Protocol, runtime_checkable
 
 from PIL import Image as PILImage
@@ -265,5 +269,294 @@ class BiometricVerifierProtocol(Protocol):
         Returns:
             512-dimensional face embedding vector, or empty list
             if no face is detected.
+        """
+        ...
+
+
+@runtime_checkable
+class ImageQualityEvaluatorProtocol(Protocol):
+    """Contract for image quality evaluation adapters.
+
+    Computes standard quality metrics to assess synthetic image fidelity:
+    FID (distributional realism), IS (quality + diversity), LPIPS
+    (perceptual similarity), SSIM (structural similarity), and PSNR
+    (pixel-level signal-to-noise ratio).
+
+    Implementations: InceptionQualityEvaluator
+    """
+
+    async def compute_fid(
+        self,
+        real_images: list[PILImage.Image],
+        synthetic_images: list[PILImage.Image],
+    ) -> float:
+        """Compute Frechet Inception Distance between real and synthetic sets.
+
+        Args:
+            real_images: Reference set of real images.
+            synthetic_images: Synthetic images to evaluate.
+
+        Returns:
+            FID score (float). Lower is better. < 50 is generally acceptable.
+        """
+        ...
+
+    async def compute_inception_score(
+        self,
+        synthetic_images: list[PILImage.Image],
+        num_splits: int,
+    ) -> tuple[float, float]:
+        """Compute Inception Score mean and std for a set of synthetic images.
+
+        Returns:
+            Tuple of (mean IS, std IS). Higher is better.
+        """
+        ...
+
+    async def compute_lpips(
+        self,
+        reference_image: PILImage.Image,
+        synthetic_image: PILImage.Image,
+    ) -> float:
+        """Compute Learned Perceptual Image Patch Similarity.
+
+        Returns:
+            LPIPS score in [0, 1]. Lower = more perceptually similar.
+        """
+        ...
+
+    async def compute_ssim(
+        self,
+        reference_image: PILImage.Image,
+        synthetic_image: PILImage.Image,
+    ) -> float:
+        """Compute Structural Similarity Index.
+
+        Returns:
+            SSIM score in [0, 1]. Higher = more similar.
+        """
+        ...
+
+    async def compute_psnr(
+        self,
+        reference_image: PILImage.Image,
+        synthetic_image: PILImage.Image,
+    ) -> float:
+        """Compute Peak Signal-to-Noise Ratio in dB.
+
+        Returns:
+            PSNR in dB. Higher is better. float("inf") for identical images.
+        """
+        ...
+
+    async def evaluate_all(
+        self,
+        reference_images: list[PILImage.Image],
+        synthetic_images: list[PILImage.Image],
+    ) -> dict[str, Any]:
+        """Compute all quality metrics and return aggregated report.
+
+        Returns:
+            Dict with fid, inception_score_mean, inception_score_std,
+            lpips_mean, ssim_mean, psnr_mean_db, overall_quality_score.
+        """
+        ...
+
+
+@runtime_checkable
+class MedicalImagingProtocol(Protocol):
+    """Contract for DICOM medical image creation and validation adapters.
+
+    Creates properly formatted DICOM files with synthetic patient data,
+    modality-appropriate acquisition parameters, and anonymization-aware
+    metadata. Validates DICOM IOD compliance.
+
+    Implementations: DicomMedicalImagingAdapter
+    """
+
+    async def create_dicom_from_pil(
+        self,
+        image: PILImage.Image,
+        modality: str,
+        anatomy: str,
+        synthetic_patient_id: str,
+        study_uid: str | None,
+        series_uid: str | None,
+        acquisition_params: dict[str, Any] | None,
+    ) -> bytes:
+        """Create a DICOM file from a PIL image.
+
+        Args:
+            image: Source synthetic image.
+            modality: DICOM modality code (CT, MR, DX, US, PT).
+            anatomy: Anatomy keyword selecting the parameter profile
+                (e.g., "chest_xray", "brain_mri", "abdominal_ct").
+            synthetic_patient_id: Non-real patient identifier for DICOM headers.
+            study_uid: DICOM Study Instance UID (generated if None).
+            series_uid: DICOM Series Instance UID (generated if None).
+            acquisition_params: Override specific acquisition parameters.
+
+        Returns:
+            DICOM file bytes.
+        """
+        ...
+
+    async def validate_dicom(self, dicom_bytes: bytes) -> dict[str, Any]:
+        """Validate a DICOM file for IOD compliance.
+
+        Returns:
+            Dict with: valid (bool), modality (str), errors (list[str]),
+            warnings (list[str]), sop_class (str).
+        """
+        ...
+
+    async def anonymize_dicom(self, dicom_bytes: bytes) -> bytes:
+        """Remove all patient-identifying attributes from a DICOM file.
+
+        Returns:
+            Anonymized DICOM bytes.
+        """
+        ...
+
+
+@runtime_checkable
+class ImageExportProtocol(Protocol):
+    """Contract for image export and object storage adapters.
+
+    Handles format encoding (PNG, JPEG, WebP, TIFF), color space
+    conversion, resolution control, thumbnail generation, and upload
+    to MinIO/S3-compatible object storage.
+
+    Implementations: ImageExportHandler
+    """
+
+    async def export_png(
+        self,
+        image: PILImage.Image,
+        compression_level: int,
+        optimize: bool,
+        include_alpha: bool,
+    ) -> bytes:
+        """Export image as PNG bytes.
+
+        Args:
+            image: Input PIL image.
+            compression_level: zlib compression level (0-9).
+            optimize: Search for smaller file size (slower).
+            include_alpha: Preserve alpha channel if present.
+
+        Returns:
+            PNG-encoded bytes.
+        """
+        ...
+
+    async def export_jpeg(
+        self,
+        image: PILImage.Image,
+        quality: int,
+        progressive: bool,
+        optimize: bool,
+        subsampling: int,
+    ) -> bytes:
+        """Export image as JPEG bytes.
+
+        Args:
+            image: Input PIL image.
+            quality: JPEG quality (1-95).
+            progressive: Encode as progressive JPEG.
+            optimize: Optimal Huffman encoding.
+            subsampling: Chroma subsampling (0=4:4:4, 1=4:2:2, 2=4:2:0).
+
+        Returns:
+            JPEG-encoded bytes.
+        """
+        ...
+
+    async def export_webp(
+        self,
+        image: PILImage.Image,
+        quality: int,
+        lossless: bool,
+        method: int,
+    ) -> bytes:
+        """Export image as WebP bytes.
+
+        Args:
+            image: Input PIL image.
+            quality: WebP quality for lossy encoding (1-100).
+            lossless: Use lossless encoding.
+            method: Encoding method (0=fastest, 6=smallest).
+
+        Returns:
+            WebP-encoded bytes.
+        """
+        ...
+
+    async def export_tiff(
+        self,
+        image: PILImage.Image,
+        compression: str,
+        dpi: tuple[int, int],
+        bit_depth_16: bool,
+    ) -> bytes:
+        """Export image as TIFF bytes.
+
+        Args:
+            image: Input PIL image.
+            compression: TIFF compression ("none", "lzw", "deflate").
+            dpi: Resolution as (horizontal_dpi, vertical_dpi).
+            bit_depth_16: Promote to 16-bit precision.
+
+        Returns:
+            TIFF-encoded bytes.
+        """
+        ...
+
+    async def upload_to_storage(
+        self,
+        image_bytes: bytes,
+        object_name: str | None,
+        bucket: str | None,
+        content_type: str,
+        metadata: dict[str, str] | None,
+        generate_presigned_url: bool,
+        presigned_expiry_seconds: int,
+    ) -> dict[str, Any]:
+        """Upload image bytes to MinIO/S3 object storage.
+
+        Returns:
+            Dict with: object_name, bucket, size_bytes, etag, presigned_url.
+        """
+        ...
+
+    async def generate_thumbnail(
+        self,
+        image: PILImage.Image,
+        max_side: int | None,
+        output_format: str,
+        jpeg_quality: int,
+    ) -> bytes:
+        """Generate a thumbnail image.
+
+        Returns:
+            Thumbnail image bytes.
+        """
+        ...
+
+    async def export_and_upload(
+        self,
+        image: PILImage.Image,
+        output_format: str,
+        job_id: uuid.UUID,
+        tenant_id: uuid.UUID,
+        export_options: dict[str, Any] | None,
+        generate_thumbnail: bool,
+        bucket: str | None,
+    ) -> dict[str, Any]:
+        """Export and upload image in one call.
+
+        Returns:
+            Dict with: object_name, bucket, thumbnail_object_name,
+            size_bytes, format, presigned_url.
         """
         ...

@@ -10,6 +10,9 @@ Services:
 - MetadataService: metadata stripping with steganographic analysis
 - ProvenanceService: C2PA provenance + invisible watermarking
 - BatchService: batch processing with progress tracking
+- QualityService: image quality metric evaluation (FID, IS, LPIPS, SSIM, PSNR)
+- MedicalImagingService: DICOM creation, validation, and anonymization pipeline
+- ExportService: multi-format export with storage upload and thumbnails
 """
 
 from __future__ import annotations
@@ -26,7 +29,10 @@ from PIL import Image as PILImage
 from aumos_image_engine.core.interfaces import (
     BiometricVerifierProtocol,
     FaceDeidentifierProtocol,
+    ImageExportProtocol,
     ImageGeneratorProtocol,
+    ImageQualityEvaluatorProtocol,
+    MedicalImagingProtocol,
     MetadataStripperProtocol,
     WatermarkerProtocol,
 )
@@ -624,3 +630,369 @@ class BatchService:
             "total": total,
             "results": all_results,
         }
+
+
+class QualityService:
+    """Evaluates quality of synthetic image sets using standard metrics.
+
+    Wraps the ImageQualityEvaluatorProtocol to provide a service-level
+    interface that logs progress, validates inputs, and returns structured
+    quality reports consumable by the API layer.
+
+    Metrics computed:
+    - FID: distributional realism vs. real image reference set
+    - IS: combined quality and diversity score
+    - LPIPS: perceptual similarity per image pair
+    - SSIM: structural similarity per image pair
+    - PSNR: pixel-level signal quality per image pair
+    """
+
+    def __init__(
+        self,
+        quality_evaluator: ImageQualityEvaluatorProtocol,
+        minimum_reference_images: int = 10,
+    ) -> None:
+        """Initialize the quality service.
+
+        Args:
+            quality_evaluator: Quality metric computation adapter.
+            minimum_reference_images: Minimum reference images required
+                for FID/IS computation. Requests below this threshold
+                will get a warning in the report.
+        """
+        self._evaluator = quality_evaluator
+        self._min_reference = minimum_reference_images
+        self._log = logger.bind(service="quality_service")
+
+    async def evaluate_batch_quality(
+        self,
+        job_id: uuid.UUID,
+        reference_images: list[PILImage.Image],
+        synthetic_images: list[PILImage.Image],
+        compute_pairwise: bool = True,
+    ) -> dict[str, Any]:
+        """Evaluate quality of a synthetic image batch.
+
+        Args:
+            job_id: Generation job identifier for logging.
+            reference_images: Real images for distributional comparison.
+            synthetic_images: Synthetic images to assess.
+            compute_pairwise: If True, compute LPIPS/SSIM/PSNR pairwise.
+                Disable for large batches when only FID/IS is needed.
+
+        Returns:
+            Dict with all quality metrics plus a warnings list and
+            an overall_quality_score (0-100).
+        """
+        log = self._log.bind(job_id=str(job_id))
+        log.info(
+            "quality.evaluation.start",
+            reference_count=len(reference_images),
+            synthetic_count=len(synthetic_images),
+        )
+
+        warnings: list[str] = []
+        if len(reference_images) < self._min_reference:
+            warnings.append(
+                f"Reference image count ({len(reference_images)}) is below the "
+                f"recommended minimum of {self._min_reference}. "
+                "FID and IS scores may be unreliable."
+            )
+
+        if not synthetic_images:
+            log.warning("quality.evaluation.empty_synthetic_set")
+            return {"error": "No synthetic images provided", "warnings": warnings}
+
+        report = await self._evaluator.evaluate_all(
+            reference_images=reference_images,
+            synthetic_images=synthetic_images,
+        )
+        report["warnings"] = warnings
+        report["job_id"] = str(job_id)
+        report["reference_image_count"] = len(reference_images)
+        report["synthetic_image_count"] = len(synthetic_images)
+
+        log.info(
+            "quality.evaluation.complete",
+            fid=report.get("fid"),
+            overall_quality=report.get("overall_quality_score"),
+        )
+        return report
+
+    async def compute_single_pair_metrics(
+        self,
+        reference_image: PILImage.Image,
+        synthetic_image: PILImage.Image,
+    ) -> dict[str, Any]:
+        """Compute pairwise quality metrics for a single image pair.
+
+        Args:
+            reference_image: Ground-truth reference.
+            synthetic_image: Synthetic image to compare against reference.
+
+        Returns:
+            Dict with lpips, ssim, psnr metrics.
+        """
+        lpips_task = self._evaluator.compute_lpips(reference_image, synthetic_image)
+        ssim_task = self._evaluator.compute_ssim(reference_image, synthetic_image)
+        psnr_task = self._evaluator.compute_psnr(reference_image, synthetic_image)
+
+        lpips_score, ssim_score, psnr_score = await asyncio.gather(
+            lpips_task, ssim_task, psnr_task
+        )
+        return {
+            "lpips": round(lpips_score, 6),
+            "ssim": round(ssim_score, 6),
+            "psnr_db": round(psnr_score, 4),
+        }
+
+
+class MedicalImagingService:
+    """Orchestrates DICOM medical image creation and validation pipeline.
+
+    Integrates with aumos-healthcare-synth for anatomy-specific generation
+    parameters. Handles the full lifecycle: PIL -> DICOM -> validate ->
+    anonymize -> return bytes.
+
+    The service enforces that all generated DICOM files pass validation
+    before being returned, and that patient data is fully anonymized.
+    """
+
+    def __init__(
+        self,
+        medical_imaging_adapter: MedicalImagingProtocol,
+        enforce_validation: bool = True,
+        enforce_anonymization: bool = True,
+    ) -> None:
+        """Initialize the medical imaging service.
+
+        Args:
+            medical_imaging_adapter: DICOM creation and validation adapter.
+            enforce_validation: If True, raise ValueError on invalid DICOM.
+            enforce_anonymization: If True, always anonymize before returning.
+        """
+        self._adapter = medical_imaging_adapter
+        self._enforce_validation = enforce_validation
+        self._enforce_anonymization = enforce_anonymization
+        self._log = logger.bind(service="medical_imaging_service")
+
+    async def synthesize_dicom(
+        self,
+        job_id: uuid.UUID,
+        tenant_id: uuid.UUID,
+        image: PILImage.Image,
+        modality: str,
+        anatomy: str,
+        study_uid: str | None = None,
+        series_uid: str | None = None,
+        acquisition_params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Create, validate, and optionally anonymize a synthetic DICOM file.
+
+        Args:
+            job_id: Generation job identifier.
+            tenant_id: Owning tenant (embedded in DICOM patient ID).
+            image: Synthetic source image.
+            modality: DICOM modality code (CT, MR, DX, US, PT).
+            anatomy: Anatomy profile name (e.g., "chest_xray", "brain_mri").
+            study_uid: Optional Study Instance UID.
+            series_uid: Optional Series Instance UID.
+            acquisition_params: Acquisition parameter overrides.
+
+        Returns:
+            Dict with:
+            - dicom_bytes: bytes — validated and anonymized DICOM file
+            - modality: str
+            - anatomy: str
+            - validation_result: dict — IOD compliance report
+            - size_bytes: int
+        """
+        log = self._log.bind(job_id=str(job_id), modality=modality, anatomy=anatomy)
+        log.info("medical_imaging.synthesize.start")
+
+        synthetic_patient_id = f"SYN-{job_id.hex[:12].upper()}-{tenant_id.hex[:4].upper()}"
+
+        # Create DICOM
+        dicom_bytes = await self._adapter.create_dicom_from_pil(
+            image=image,
+            modality=modality,
+            anatomy=anatomy,
+            synthetic_patient_id=synthetic_patient_id,
+            study_uid=study_uid,
+            series_uid=series_uid,
+            acquisition_params=acquisition_params,
+        )
+        log.info("medical_imaging.synthesize.created", size_bytes=len(dicom_bytes))
+
+        # Validate
+        validation_result = await self._adapter.validate_dicom(dicom_bytes)
+        if self._enforce_validation and not validation_result.get("valid", False):
+            errors = validation_result.get("errors", [])
+            log.error("medical_imaging.synthesize.validation_failed", errors=errors)
+            raise ValueError(f"DICOM validation failed: {'; '.join(errors)}")
+
+        # Anonymize
+        if self._enforce_anonymization:
+            dicom_bytes = await self._adapter.anonymize_dicom(dicom_bytes)
+            log.info("medical_imaging.synthesize.anonymized", size_bytes=len(dicom_bytes))
+
+        log.info("medical_imaging.synthesize.complete")
+        return {
+            "dicom_bytes": dicom_bytes,
+            "modality": modality,
+            "anatomy": anatomy,
+            "validation_result": validation_result,
+            "size_bytes": len(dicom_bytes),
+            "synthetic_patient_id": synthetic_patient_id,
+        }
+
+    async def validate_external_dicom(
+        self,
+        dicom_bytes: bytes,
+    ) -> dict[str, Any]:
+        """Validate an externally provided DICOM file.
+
+        Args:
+            dicom_bytes: Raw DICOM bytes to validate.
+
+        Returns:
+            Validation result dict from the adapter.
+        """
+        result = await self._adapter.validate_dicom(dicom_bytes)
+        self._log.info(
+            "medical_imaging.external_validation",
+            valid=result.get("valid"),
+            modality=result.get("modality"),
+        )
+        return result
+
+
+class ExportService:
+    """Orchestrates image export, format conversion, and storage upload.
+
+    Provides a unified interface for exporting generated or de-identified
+    images to various formats and uploading to MinIO object storage with
+    automatic thumbnail generation and presigned URL support.
+    """
+
+    def __init__(
+        self,
+        export_handler: ImageExportProtocol,
+        default_format: str = "PNG",
+        always_generate_thumbnail: bool = True,
+    ) -> None:
+        """Initialize the export service.
+
+        Args:
+            export_handler: Format encoding and storage upload adapter.
+            default_format: Default output format when not specified.
+            always_generate_thumbnail: Always generate a thumbnail on export.
+        """
+        self._handler = export_handler
+        self._default_format = default_format
+        self._always_generate_thumbnail = always_generate_thumbnail
+        self._log = logger.bind(service="export_service")
+
+    async def export_image(
+        self,
+        job_id: uuid.UUID,
+        tenant_id: uuid.UUID,
+        image: PILImage.Image,
+        output_format: str | None = None,
+        export_options: dict[str, Any] | None = None,
+        bucket: str | None = None,
+    ) -> dict[str, Any]:
+        """Export and upload a single image.
+
+        Args:
+            job_id: Generation job identifier.
+            tenant_id: Owning tenant.
+            image: Image to export.
+            output_format: Target format (PNG, JPEG, WEBP, TIFF).
+                Defaults to service default_format.
+            export_options: Format-specific options (quality, compression, etc.).
+            bucket: Override default storage bucket.
+
+        Returns:
+            Dict with object_name, bucket, thumbnail_object_name,
+            size_bytes, format, etag, presigned_url.
+        """
+        effective_format = (output_format or self._default_format).upper()
+        log = self._log.bind(job_id=str(job_id), format=effective_format)
+        log.info("export.start")
+
+        result = await self._handler.export_and_upload(
+            image=image,
+            output_format=effective_format,
+            job_id=job_id,
+            tenant_id=tenant_id,
+            export_options=export_options or {},
+            generate_thumbnail=self._always_generate_thumbnail,
+            bucket=bucket,
+        )
+
+        log.info(
+            "export.complete",
+            object_name=result.get("object_name"),
+            size_bytes=result.get("size_bytes"),
+        )
+        return result
+
+    async def export_batch(
+        self,
+        job_id: uuid.UUID,
+        tenant_id: uuid.UUID,
+        images: list[PILImage.Image],
+        output_format: str | None = None,
+        export_options: dict[str, Any] | None = None,
+        max_concurrency: int = 4,
+        bucket: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Export and upload a batch of images concurrently.
+
+        Args:
+            job_id: Batch job identifier (shared across all images).
+            tenant_id: Owning tenant.
+            images: List of images to export.
+            output_format: Target format for all images.
+            export_options: Format-specific options.
+            max_concurrency: Maximum concurrent uploads.
+            bucket: Override default storage bucket.
+
+        Returns:
+            List of export result dicts in the same order as input images.
+        """
+        log = self._log.bind(job_id=str(job_id), total_images=len(images))
+        log.info("export.batch.start")
+
+        semaphore = asyncio.Semaphore(max_concurrency)
+
+        async def export_one(image_index: int, image: PILImage.Image) -> dict[str, Any]:
+            async with semaphore:
+                # Give each image a unique sub-job ID for storage path differentiation
+                sub_job_id = uuid.UUID(
+                    hex=f"{job_id.hex[:24]}{image_index:08x}"[:32]
+                )
+                try:
+                    return await self.export_image(
+                        job_id=sub_job_id,
+                        tenant_id=tenant_id,
+                        image=image,
+                        output_format=output_format,
+                        export_options=export_options,
+                        bucket=bucket,
+                    )
+                except Exception as exc:
+                    log.error("export.batch.image_failed", index=image_index, error=str(exc))
+                    return {
+                        "index": image_index,
+                        "error": str(exc),
+                        "object_name": None,
+                    }
+
+        tasks = [export_one(idx, img) for idx, img in enumerate(images)]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+
+        successful = sum(1 for r in results if r.get("object_name") is not None)
+        log.info("export.batch.complete", successful=successful, total=len(images))
+        return list(results)
