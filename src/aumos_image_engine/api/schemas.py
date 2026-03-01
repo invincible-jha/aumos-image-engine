@@ -403,3 +403,101 @@ class BatchStatusResponse(BaseModel):
     )
     created_at: datetime
     updated_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# Synchronous Generation (GAP-81)
+# ---------------------------------------------------------------------------
+
+
+class SyncGenerateRequest(BaseModel):
+    """Request for synchronous single-image generation via SDXL Turbo."""
+
+    prompt: str = Field(min_length=1, max_length=1000, description="Text prompt for generation")
+    width: int = Field(default=512, ge=256, le=1024, description="Output image width in pixels")
+    height: int = Field(default=512, ge=256, le=1024, description="Output image height in pixels")
+    seed: int | None = Field(default=None, ge=0, description="Random seed for reproducibility")
+
+
+# ---------------------------------------------------------------------------
+# Inpainting (GAP-80)
+# ---------------------------------------------------------------------------
+
+
+class InpaintRequest(BaseModel):
+    """Request to inpaint masked regions of an image."""
+
+    image_uri: str = Field(description="MinIO URI of the input image")
+    mask_uri: str = Field(
+        description="MinIO URI of the binary mask (white = inpaint, black = preserve)"
+    )
+    prompt: str = Field(min_length=1, max_length=1000, description="Prompt for inpainted content")
+    negative_prompt: str | None = Field(default=None, description="Negative guidance prompt")
+    strength: float = Field(
+        default=0.75,
+        ge=0.0,
+        le=1.0,
+        description="Inpainting strength (higher = more deviation from input)",
+    )
+    num_inference_steps: int = Field(default=20, ge=1, le=100)
+    guidance_scale: float = Field(default=7.5, ge=1.0, le=20.0)
+    seed: int | None = Field(default=None, ge=0)
+
+
+# ---------------------------------------------------------------------------
+# LoRA Fine-Tuning (GAP-78)
+# ---------------------------------------------------------------------------
+
+
+class FinetuneJobRequest(BaseModel):
+    """Request to submit a LoRA fine-tuning job."""
+
+    base_model: str = Field(
+        default="sdxl",
+        description="Base model to fine-tune (sd15 | sdxl | sd35)",
+    )
+    concept_prompt: str = Field(
+        min_length=1,
+        max_length=500,
+        description="Unique token concept prompt (e.g., 'a photo of sks industrial widget')",
+    )
+    reference_image_uris: list[str] = Field(
+        min_length=5,
+        max_length=100,
+        description="MinIO URIs of reference images (5-100 images recommended)",
+    )
+
+    @field_validator("base_model")
+    @classmethod
+    def validate_base_model(cls, value: str) -> str:
+        """Validate that the base model is supported for fine-tuning."""
+        supported = {"sd15", "sdxl", "sd35"}
+        if value not in supported:
+            raise ValueError(f"base_model must be one of {supported}")
+        return value
+
+
+class FinetuneJobResponse(BaseModel):
+    """Response from LoRA fine-tuning job submission."""
+
+    job_id: uuid.UUID
+    status: str
+    base_model: str
+    num_reference_images: int
+
+
+class FinetuneJobStatusResponse(BaseModel):
+    """Status response for a LoRA fine-tuning job."""
+
+    job_id: uuid.UUID
+    status: str
+    base_model: str
+    training_steps_completed: int
+    training_time_s: float | None = None
+    adapter_uri: str | None = Field(
+        default=None,
+        description="MinIO URI of the trained LoRA adapter (.safetensors)",
+    )
+    error_message: str | None = None
+    created_at: datetime
+    updated_at: datetime

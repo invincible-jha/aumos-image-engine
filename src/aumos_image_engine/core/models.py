@@ -17,6 +17,7 @@ from typing import Any
 from sqlalchemy import (
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -272,3 +273,83 @@ class ImageBatch(TenantMixin, Base):
 
     def __repr__(self) -> str:
         return f"<ImageBatch id={self.id} name={self.name!r} status={self.processing_status}>"
+
+
+class ImageFinetuneJob(TenantMixin, Base):
+    """Tracks a LoRA fine-tuning job for domain-specific image adaptation.
+
+    A fine-tuning job trains a LoRA adapter on tenant-provided reference images.
+    The resulting adapter is stored in MinIO and referenced in generation jobs
+    via lora_adapter_id.
+
+    Status flow: pending → processing → completed | failed
+    """
+
+    __tablename__ = "img_finetune_jobs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        comment="Primary key",
+    )
+    base_model: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        comment="Base model name: sd15 | sdxl | sd35",
+    )
+    concept_prompt: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        comment="DreamBooth concept prompt used for training",
+    )
+    reference_image_uris: Mapped[list[Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+        comment="MinIO URIs of reference images used for fine-tuning",
+    )
+    adapter_uri: Mapped[str | None] = mapped_column(
+        String(1024),
+        nullable=True,
+        comment="MinIO URI of the trained LoRA adapter (.safetensors)",
+    )
+    status: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        default="pending",
+        index=True,
+        comment="Job status: pending | processing | completed | failed",
+    )
+    training_steps_completed: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        comment="Number of training steps completed",
+    )
+    training_time_s: Mapped[float | None] = mapped_column(
+        Float,
+        nullable=True,
+        comment="Total training time in seconds",
+    )
+    error_message: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="Error message if training failed",
+    )
+
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    def __repr__(self) -> str:
+        return f"<ImageFinetuneJob id={self.id} base_model={self.base_model} status={self.status}>"

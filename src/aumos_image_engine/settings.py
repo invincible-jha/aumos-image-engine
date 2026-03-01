@@ -92,6 +92,22 @@ class ImageEngineSettings(BaseSettings):
     biometric_verification_enabled: bool = Field(default=True)
     frvt_threshold: float = Field(default=0.05, ge=0.0, le=1.0)
 
+    # Multi-model adapter registry
+    default_model: str = Field(default="sd35", description="Default generation model name")
+    allowed_models: list[str] = Field(
+        default=["sd15", "sdxl", "sdxl_turbo", "sd35", "sd35_medium"],
+        description="Comma-separated list of allowed model names",
+    )
+    gpu_enabled: bool = Field(default=True, description="Whether GPU inference is enabled")
+
+    # LoRA fine-tuning
+    lora_rank: int = Field(default=16, ge=1, le=128, description="LoRA adapter rank")
+    lora_max_train_steps: int = Field(default=500, ge=1)
+    lora_learning_rate: float = Field(default=1e-4, gt=0.0)
+
+    # Sync generation rate limiting
+    sync_rate_limit_per_tenant_per_minute: int = Field(default=60, ge=1)
+
     # Batch processing
     batch_max_size: int = Field(default=100, ge=1, le=1000)
     batch_concurrency: int = Field(default=4, ge=1, le=32)

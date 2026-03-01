@@ -20,18 +20,25 @@ from typing import Annotated
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 
+from fastapi.responses import Response
+
 from aumos_image_engine.api.schemas import (
     BatchGenerationRequest,
     BatchStatusResponse,
     DeidentifyImageRequest,
     DeidentifyImageResponse,
+    FinetuneJobRequest,
+    FinetuneJobResponse,
+    FinetuneJobStatusResponse,
     GenerateImageRequest,
     GenerateImageResponse,
+    InpaintRequest,
     JobStatus,
     JobStatusResponse,
     JobType,
     StripMetadataRequest,
     StripMetadataResponse,
+    SyncGenerateRequest,
     VerifyBiometricRequest,
     VerifyBiometricResponse,
 )
@@ -463,4 +470,219 @@ async def create_batch(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to create batch job",
+        ) from exc
+
+
+@router.post(
+    "/generate/sync",
+    summary="Synchronous image generation (SDXL Turbo)",
+    description=(
+        "Generate a single image synchronously using SDXL Turbo (1-step inference). "
+        "Returns PNG bytes directly in the response body. "
+        "Rate-limited per tenant. Use for interactive applications needing sub-2s generation."
+    ),
+    response_class=Response,
+    responses={
+        200: {"content": {"image/png": {}}, "description": "PNG image bytes"},
+        429: {"description": "Rate limit exceeded"},
+    },
+)
+async def generate_sync(
+    request_body: SyncGenerateRequest,
+    tenant_id: TenantDep,
+    request: Request,
+) -> Response:
+    """Generate a single image synchronously using SDXL Turbo."""
+    log = logger.bind(tenant_id=str(tenant_id), endpoint="generate_sync")
+    log.info("api.generate_sync.requested", prompt_length=len(request_body.prompt))
+
+    try:
+        from aumos_image_engine.adapters.generators.model_registry import ModelAdapterRegistry
+
+        settings = request.app.state.settings
+        registry: ModelAdapterRegistry = request.app.state.model_registry
+
+        adapter = await registry.get_warmed("sdxl_turbo")
+        image_bytes = await adapter.generate(
+            prompt=request_body.prompt,
+            width=request_body.width,
+            height=request_body.height,
+            seed=request_body.seed,
+        )
+
+        log.info("api.generate_sync.complete", image_size_bytes=len(image_bytes))
+        return Response(content=image_bytes, media_type="image/png")
+
+    except Exception as exc:
+        log.error("api.generate_sync.failed", error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Synchronous image generation failed",
+        ) from exc
+
+
+@router.post(
+    "/inpaint",
+    summary="Inpaint masked image regions",
+    description=(
+        "Fill masked regions of an image with prompt-guided generated content. "
+        "Mask is a binary image where white pixels indicate regions to inpaint. "
+        "Returns PNG bytes of the inpainted image."
+    ),
+    response_class=Response,
+    responses={200: {"content": {"image/png": {}}, "description": "Inpainted PNG image bytes"}},
+)
+async def inpaint_image(
+    request_body: InpaintRequest,
+    tenant_id: TenantDep,
+    request: Request,
+) -> Response:
+    """Inpaint masked regions of an image using SD inpainting pipeline."""
+    log = logger.bind(tenant_id=str(tenant_id), endpoint="inpaint")
+    log.info(
+        "api.inpaint.requested",
+        image_uri=request_body.image_uri,
+        mask_uri=request_body.mask_uri,
+    )
+
+    try:
+        from aumos_image_engine.adapters.generators.inpainting_adapter import InpaintingAdapter
+
+        storage = request.app.state.storage
+        settings = request.app.state.settings
+
+        image_bytes = await storage.download(request_body.image_uri)
+        mask_bytes = await storage.download(request_body.mask_uri)
+
+        inpainter: InpaintingAdapter = request.app.state.inpainting_adapter
+        result_bytes = await inpainter.inpaint(
+            image_bytes=image_bytes,
+            mask_bytes=mask_bytes,
+            prompt=request_body.prompt,
+            negative_prompt=request_body.negative_prompt,
+            strength=request_body.strength,
+            num_inference_steps=request_body.num_inference_steps,
+            guidance_scale=request_body.guidance_scale,
+            seed=request_body.seed,
+        )
+
+        log.info("api.inpaint.complete", output_size_bytes=len(result_bytes))
+        return Response(content=result_bytes, media_type="image/png")
+
+    except Exception as exc:
+        log.error("api.inpaint.failed", error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Inpainting failed",
+        ) from exc
+
+
+@router.post(
+    "/finetune",
+    response_model=FinetuneJobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Submit LoRA fine-tuning job",
+    description=(
+        "Train a LoRA adapter on tenant-provided reference images. "
+        "Accepts 20-100 reference image URIs and a concept prompt. "
+        "Returns a finetune job ID; poll /finetune/{id} for status."
+    ),
+)
+async def create_finetune_job(
+    request_body: FinetuneJobRequest,
+    tenant_id: TenantDep,
+    request: Request,
+) -> FinetuneJobResponse:
+    """Queue a LoRA fine-tuning job."""
+    log = logger.bind(tenant_id=str(tenant_id), endpoint="finetune")
+    job_id = uuid.uuid4()
+
+    log.info(
+        "api.finetune.requested",
+        job_id=str(job_id),
+        base_model=request_body.base_model,
+        num_images=len(request_body.reference_image_uris),
+    )
+
+    try:
+        from aumos_image_engine.adapters.repositories import ImageFinetuneJobRepository
+        from aumos_image_engine.core.models import ImageFinetuneJob
+
+        finetune_job = ImageFinetuneJob(
+            id=job_id,
+            tenant_id=tenant_id,
+            base_model=request_body.base_model,
+            concept_prompt=request_body.concept_prompt,
+            reference_image_uris=request_body.reference_image_uris,
+            status="pending",
+            training_steps_completed=0,
+        )
+
+        db_engine = request.app.state.db_engine
+        repo = ImageFinetuneJobRepository(engine=db_engine)
+        await repo.create(finetune_job)
+
+        log.info("api.finetune.job_created", job_id=str(job_id))
+
+        return FinetuneJobResponse(
+            job_id=job_id,
+            status="pending",
+            base_model=request_body.base_model,
+            num_reference_images=len(request_body.reference_image_uris),
+        )
+
+    except Exception as exc:
+        log.error("api.finetune.failed", error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to queue fine-tuning job",
+        ) from exc
+
+
+@router.get(
+    "/finetune/{job_id}",
+    response_model=FinetuneJobStatusResponse,
+    summary="Get fine-tuning job status",
+    description="Poll the status of a LoRA fine-tuning job.",
+)
+async def get_finetune_job_status(
+    job_id: uuid.UUID,
+    tenant_id: TenantDep,
+    request: Request,
+) -> FinetuneJobStatusResponse:
+    """Retrieve the current status of a fine-tuning job."""
+    log = logger.bind(tenant_id=str(tenant_id), job_id=str(job_id))
+
+    try:
+        from aumos_image_engine.adapters.repositories import ImageFinetuneJobRepository
+
+        db_engine = request.app.state.db_engine
+        repo = ImageFinetuneJobRepository(engine=db_engine)
+        job = await repo.get_by_id(job_id=job_id, tenant_id=tenant_id)
+
+        if job is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Fine-tuning job {job_id} not found",
+            )
+
+        return FinetuneJobStatusResponse(
+            job_id=job.id,
+            status=job.status,
+            base_model=job.base_model,
+            training_steps_completed=job.training_steps_completed,
+            training_time_s=job.training_time_s,
+            adapter_uri=job.adapter_uri,
+            error_message=job.error_message,
+            created_at=job.created_at,
+            updated_at=job.updated_at,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.error("api.finetune.get_status.failed", error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve fine-tuning job status",
         ) from exc
